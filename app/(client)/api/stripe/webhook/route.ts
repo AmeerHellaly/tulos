@@ -1,8 +1,16 @@
 import { Metadata } from "@/actions/createCheckoutSession";
-import stripe from "@/lib/stripe";
 import { headers } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+
+// Lazy initialization for Stripe (to avoid build-time errors)
+function getStripe() {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  if (!secretKey) {
+    throw new Error("STRIPE_SECRET_KEY is not set");
+  }
+  return new Stripe(secretKey, { apiVersion: "2024-06-20" }); // حدث apiVersion للأحدث
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.text();
@@ -13,26 +21,32 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "No signature" }, { status: 400 });
   }
 
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return NextResponse.json({ error: "Webhook secret not set" }, { status: 500 });
+  }
+
   let event: Stripe.Event;
 
   try {
+    const stripe = getStripe();
     event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
   } catch (error) {
+    console.error("Webhook signature verification failed:", error);
     return NextResponse.json({ error: `Webhook Error: ${error}` }, { status: 400 });
   }
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object as Stripe.Checkout.Session;
     const invoice = session.invoice
-      ? await stripe.invoices.retrieve(session.invoice as string)
+      ? await getStripe().invoices.retrieve(session.invoice as string)
       : null;
 
     try {
       await createOrderInDjango(session, invoice);
     } catch (error) {
       console.error("❌ Error saving order to Django:", error);
-      return NextResponse.json({ error: `Error: ${error}` }, { status: 400 });
+      return NextResponse.json({ error: `Order creation error: ${error}` }, { status: 500 });
     }
   }
 
@@ -41,8 +55,9 @@ export async function POST(req: NextRequest) {
 
 async function createOrderInDjango(
   session: Stripe.Checkout.Session,
-  invoice: Stripe.Invoice | null
+  invoice: Stripe.Invoice | null // استخدمها لو محتاج، أو امسحها لو مش مستخدمة
 ) {
+  const stripe = getStripe(); // Lazy init هنا كمان
   const {
     id,
     amount_total,
@@ -90,45 +105,55 @@ async function createOrderInDjango(
     items,
   };
 
-  // 🧾 إرسال الطلب إلى Django
-  const res = await fetch("http://127.0.0.1:8000/order/api/orders/create/", {
+  // 🧾 إرسال الطلب إلى Django (استخدم env var للـ URL)
+  const djangoUrl = process.env.DJANGO_API_URL || "http://127.0.0.1:8000/order/api/orders/create/";
+  const res = await fetch(djangoUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json", },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(orderPayload),
   });
 
   if (!res.ok) {
     const text = await res.text();
     console.error("❌ Django response error:", res.status, text);
+    throw new Error(`Django API error: ${res.status} - ${text}`);
   }
 
-// ✅ تجميع العناصر حسب product_id + size
-const groupedItems = items.reduce((acc, item) => {
-  const key = `${item.id}-${item.size}`;
-  if (!acc[key]) {
-    acc[key] = { ...item, quantity: 0 };
+  console.log("✅ Order created in Django successfully");
+
+  // ✅ تجميع العناصر حسب product_id + size
+  const groupedItems = items.reduce((acc, item) => {
+    const key = `${item.id}-${item.size}`;
+    if (!acc[key]) {
+      acc[key] = { ...item, quantity: 0 };
+    }
+    acc[key].quantity += item.quantity;
+    return acc;
+  }, {} as Record<string, typeof items[0]>);
+
+  // ✅ خصم الكمية مرة وحدة لكل منتج/مقاس
+  const deductUrl = process.env.DJANGO_API_URL ? `${process.env.DJANGO_API_URL.replace('/order/api/orders/create/', '/api/api/variants/deduct/')}` : "http://127.0.0.1:8000/api/api/variants/deduct/";
+  for (const key in groupedItems) {
+    const item = groupedItems[key];
+    try {
+      const deductRes = await fetch(deductUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          product_id: item.id,
+          size: item.size || "",
+          quantity: item.quantity,
+        }),
+      });
+
+      if (!deductRes.ok) {
+        const deductText = await deductRes.text();
+        console.error(`❌ Stock deduction failed for ${item.name}: ${deductRes.status} - ${deductText}`);
+      } else {
+        console.log(`✅ Stock deducted for ${item.name}: ${item.quantity} units`);
+      }
+    } catch (error) {
+      console.error(`❌ Error updating stock for ${item.name}:`, error);
+    }
   }
-  acc[key].quantity += item.quantity;
-  return acc;
-}, {} as Record<string, typeof items[0]>);
-
-// ✅ خصم الكمية مرة وحدة لكل منتج/مقاس
-for (const key in groupedItems) {
-  const item = groupedItems[key];
-  try {
-    await fetch("http://127.0.0.1:8000/api/api/variants/deduct/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        product_id: item.id,
-        size: item.size || "", // فارغ إذا ما في مقاس
-        quantity: item.quantity,
-      }),
-    });
-  } catch (error) {
-    console.error(`❌ Error updating stock for ${item.name}:`, error);
-  }
-}
-
-
 }
