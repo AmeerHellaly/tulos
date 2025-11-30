@@ -27,8 +27,12 @@ const Page = () => {
     setLoading(true);
     setError("");
 
+    // ✅ استخدم الـ URL الديناميكي: production من env، fallback للمحلي
+    const baseUrl = process.env.NEXT_PUBLIC_DJANGO_API_URL || "http://127.0.0.1:8000";
+    const loginUrl = `${baseUrl}/accounts/login/`;
+
     try {
-      const res = await fetch("http://127.0.0.1:8000/accounts/login/", {
+      const res = await fetch(loginUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -120,7 +124,6 @@ const Page = () => {
             </div>
           </div>
 
-     
         </CardContent>
 
         <CardFooter className="flex justify-center">
